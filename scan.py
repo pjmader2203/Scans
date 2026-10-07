@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""scan.py v1 (master prompt v7.4): EVM data layer for Robinhood Chain + Base. Prints evidence with fixed definitions and bands; Claude judges.
-scan.py <addr> [quick|standard|recheck|activity] [--chain robinhood|base] [--platform 0xA,0xB] [--wallets 0xA,0xB] [--liq-floor N]  |  scan.py --bands"""
+"""scan.py v2 (master prompt v7.5): EVM data layer for Robinhood Chain, Base, Ethereum. Prints evidence with fixed definitions and bands; Claude judges.
+scan.py <addr> [quick|standard|recheck|activity] [--chain robinhood|base|ethereum] [--platform 0xA,0xB] [--wallets 0xA,0xB] [--liq-floor N]  |  scan.py --bands
+Chain is auto-detected (DexScreener, highest liquidity); Solana addresses are recognised but not yet covered (manual)."""
 import sys, re, time, statistics as S, collections as C, concurrent.futures as cf, requests
 from datetime import datetime, timezone
 T0, N = time.time(), [0]
@@ -12,17 +13,36 @@ CH = {"robinhood": dict(rpc="https://rpc.mainnet.chain.robinhood.com", cid=4663,
                         stable="0x5fc5360d0400a0fd4f2af552add042d716f1d168", ref="0xa92768863a55d8A0591709f7f5E594A249d36Ea3",
                         infra={"0x267444d099b10fb5ed7c3cc7b7c767adca574952": "Pons locker", "0x8366a39cc670b4001a1121b8f6a443a643e40951": "V4 PoolManager"}),
       "base": dict(rpc="https://mainnet.base.org", cid=8453, llama="Base", fomo=0, span=2000, bs="https://base.blockscout.com",
-                   stable="0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", ref=None, infra={"0x498581ff718922c3f8e6a244956af099b2652b2b": "V4 PoolManager"})}
+                   stable="0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", ref=None, infra={"0x498581ff718922c3f8e6a244956af099b2652b2b": "V4 PoolManager"}),
+      # Ethereum: publicnode serves logs for ~1 day only (archive needs a key) -> logs via Blockscout eth-rpc (keyless, silently capped at 1,000 logs -> split).
+      # infra verified 7 Oct 2026: Uniswap from github.com/Uniswap/sdks (sdk-core addresses.ts); UNCX from docs.uncx.network contracts pages. Team Finance: no reachable official list -> not included (GoPlus tags still shown).
+      "ethereum": dict(rpc="https://ethereum-rpc.publicnode.com", logrpc="https://eth.blockscout.com/api/eth-rpc", cid=1, llama="Ethereum", fomo=0, span=50_000, gt="eth", gas=1,
+                       bs="https://eth.blockscout.com", stable="0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", ref=None,
+                       infra={"0x000000000004444c5dc75cb358380d2e3de08a90": "V4 PoolManager", "0xbd216513d74c8cf14cf4747e6aaa6420ff64ee9e": "V4 PositionManager",
+                              "0xc36442b4a4522e871399cd717abdd847ab11fe88": "V3 PositionManager", "0x663a5c229c09b049e36dcc11a9b0d4a8eb9db214": "UNCX V2 locker",
+                              "0x231278edd38b00b07fbd52120cef685b9baebcc1": "UNCX V3 locker", "0x7f5c649856f900d15c83741f45ae46f5c6858234": "UNCX V3.1 locker",
+                              "0x147aeca171a79466fe9e2c03f21b45155ff403f8": "UNCX V4 locker", "0xdba68f07d1b7ca219f78ae8582c213d975c25caf": "UNCX vesting (legacy)",
+                              "0xa98f06312b7614523d0f5e725e15fd20fb1b99f5": "UNCX vesting V2"})}
+LB_URL = "https://fomoradar.app/api/leaderboard"  # Robinhood Chain scores; cross-matched on Base/Ethereum as a LEAD (same address = same smart wallet, tested 7 Oct 2026)
 EXCL = re.compile(r"pool|lock|router|exchange|bridge|binance|coinbase|bybit|okx|mexc|kucoin|gate\.io", re.I)
 # THE KPI definitions (prompt §7 points here): value < cut[i] -> label[i], else the last label.
 BANDS = {"mc_liq": ([10, 25], ["comfortable", "normal", "fragile"]), "vol_liq": ([0.2, 0.5, 2, 5], ["dead", "low", "healthy", "elevated", "churn/wash"]),
          "buy_sell": ([0.8, 1.25], ["sell skew", "balanced", "buy skew"]), "adj_top10": ([20, 35], ["good", "watch", "concentrated"]),
-         "whale_exit": ([25], ["ok", "whale-exit risk"]), "trend": ([-15, 15], ["decaying", "flat", "rising"]), "chain": ([-25, 25], ["bust", "flat", "boom"])}
+         "whale_exit": ([25], ["ok", "whale-exit risk"]), "trend": ([-15, 15], ["decaying", "flat", "rising"]), "chain": ([-25, 25], ["bust", "flat", "boom"]),
+         "dds": ([25, 50], ["LOOSE", "MIXED", "FIRM"]), "abs": ([0.6, 1.0], ["WEAK", "MIXED", "STRONG"])}
 RULES = ["trend = per-day average last 3d vs prior 4d (rolling 24h days); chain = chain DEX volume last 7d vs prior 7d (DefiLlama)",
          "exit cap = largest sell at <=5% impact incl. fees (interpolated quotes); stressed = impact above the $1K quote doubled (-50% liquidity)",
          "adj top-10 = 10 largest holders by live balance excl. pools, lockers, burn, PoolManager, CEX/protocol tags (team/treasury/token contracts count); missing ranks filled as upper bound",
          "early stop: liq <$25K (quick <$10K) | >=90% below ATH with vol/liq <0.2 | 0 trades 24h | honeypot or sell restriction",
-         "holders: 8 largest external profiled; age bins <3d 3-7d 7-14d 14-21d >21d; entry = daily close on first-buy day (ESTIMATED)"]
+         "holders: 8 largest external profiled; age bins <3d 3-7d 7-14d 14-21d >21d; entry = daily close on first-buy day (ESTIMATED)",
+         "DDS (drawdowns survived) = % of profiled top-holder supply held through >=1 drawdown >=30% (zigzag on daily closes: >=30% fall from a local high; a new high needs a >=30% rebound); "
+         "survived = held before the high and sent <25% of that bag by the low; credited part = min(bag at the high x (1 - sold share), bag now); creator and same-block clusters excluded and listed; "
+         "history not reaching the high = no credit; no >=30% drawdown = NOT YET OBSERVABLE",
+         "ABS (dip absorption) = dips of >=15% from the 24h high (hourly candles 7d, largest pool, GeckoTerminal, price proxy ESTIMATED); retraced = share of the drop recovered by the close 24h after the low; "
+         "low held = no lower low in those 24h; buy/sell = USD bought vs sold in that pool after the low (last 300 trades, recent dips only); score = max(buy/sell, 2 x retraced share) so 50% retraced = 1.0; "
+         "band = median score of all dips; no dip = NOT YET OBSERVABLE",
+         "chain detection: Solana by address format; 0x via DexScreener (highest-liquidity chain, other chains listed); --chain overrides; Ethereum exit ladder includes gas (KyberSwap gasUsd)",
+         "FOMO cross-match (Base/Ethereum): top holders matched to the Robinhood Chain FOMO leaderboard; a LEAD only (RHC score, other-chain record)"]
 
 
 def band(k, v):
@@ -47,13 +67,13 @@ pct = lambda a, b: (a / b - 1) * 100 if a is not None and b else None
 
 
 class Ch:
-    def __init__(s, n): s.n = n; s.__dict__.update(CH[n])
+    def __init__(s, n): s.n = s.gt = n; s.logrpc = s.gas = None; s.__dict__.update(CH[n])
 
-    def call(s, m, p):
+    def call(s, m, p, url=None):
         e = None
         for _ in range(3):
             N[0] += 1
-            try: r = requests.post(s.rpc, json={"jsonrpc": "2.0", "id": 1, "method": m, "params": p}, headers=UA, timeout=25).json()
+            try: r = requests.post(url or s.rpc, json={"jsonrpc": "2.0", "id": 1, "method": m, "params": p}, headers=UA, timeout=25).json()
             except Exception as x: e = str(x)[:80]; time.sleep(1); continue
             if "error" not in r: return r["result"]
             e = str(r["error"].get("message"))[:120]
@@ -73,16 +93,23 @@ class Ch:
                 except Exception: o.append(None)
             return o
 
-    def logs(s, a, f, t, tp, d=0):
+    def logs(s, a, f, t, tp, d=0, cap_ok=False):  # cap_ok: a capped Blockscout answer is the complete earliest-1,000 prefix (verified 7 Oct 2026)
+        if s.logrpc and time.time() - T0 > 70: raise RuntimeError("time budget (Ethereum logs)")
         if t - f >= s.span:  # RPC block-range limit: chunk
             if (t - f) / s.span > 60: raise RuntimeError(f"range too large for keyless RPC ({s.span:,}-block limit)")
             o, x = [], f
-            while x <= t: y = min(x + s.span - 1, t); o += s.logs(a, x, y, tp, d); x = y + 1
+            while x <= t: y = min(x + s.span - 1, t); o += s.logs(a, x, y, tp, d, cap_ok); x = y + 1
             return o
-        try: return s.call("eth_getLogs", [{"address": a, "fromBlock": hex(f), "toBlock": hex(t), "topics": tp}])
+        try:
+            q = [{"address": a, "fromBlock": hex(f), "toBlock": hex(t), "topics": tp}]
+            r = s.call("eth_getLogs", q, s.logrpc)
+            if r is None and s.logrpc: time.sleep(1); r = s.call("eth_getLogs", q, s.logrpc)
+            if r is None: raise RuntimeError("too large (null result)")
+            if s.logrpc and len(r) >= 1000 and not cap_ok: raise RuntimeError("too many logs (Blockscout 1,000 cap)")
+            return r
         except RuntimeError as e:  # >10K logs: split
             if re.search("limit|too many|too large", str(e), re.I) and t - f > 50 and d < 8:
-                m = (f + t) // 2; return s.logs(a, f, m, tp, d + 1) + s.logs(a, m + 1, t, tp, d + 1)
+                m = (f + t) // 2; return s.logs(a, f, m, tp, d + 1, cap_ok) + s.logs(a, m + 1, t, tp, d + 1, cap_ok)
             raise
 
     def setup(s):
@@ -125,7 +152,7 @@ def safe(n, f, *a):
 
 
 def tape(ch, A):
-    g = f"https://api.geckoterminal.com/api/v2/networks/{ch.n}/tokens/{A}"
+    g = f"https://api.geckoterminal.com/api/v2/networks/{ch.gt}/tokens/{A}"
     with cf.ThreadPoolExecutor(3) as ex: ds, gt, gi = ex.map(get, [f"https://api.dexscreener.com/latest/dex/tokens/{A}", g + "?include=top_pools", g + "/info"])
     P = [p for p in (ds or {}).get("pairs") or [] if p.get("chainId") == ch.n and A.lower() in (p["baseToken"]["address"].lower(), p["quoteToken"]["address"].lower())]
     if not P: raise RuntimeError("not on DexScreener for this chain (too new / wrong chain)")
@@ -156,7 +183,7 @@ def tape(ch, A):
 def history(ch, d):
     ps = [p for p in d["pools"] if p["liq"] >= 0.03 * (d["liq"] or 1)] or d["pools"]
     ps = list({p["id"]: p for p in [min(ps, key=lambda p: p["c"])] + sorted(d["pools"], key=lambda p: -p["vol"])[:2]}.values())
-    with cf.ThreadPoolExecutor(3) as ex: cs = list(ex.map(lambda p: get(f"https://api.geckoterminal.com/api/v2/networks/{ch.n}/pools/{p['id']}/ohlcv/day?limit=365"), ps))
+    with cf.ThreadPoolExecutor(3) as ex: cs = list(ex.map(lambda p: get(f"https://api.geckoterminal.com/api/v2/networks/{ch.gt}/pools/{p['id']}/ohlcv/day?limit=365"), ps))
     cs = [sorted(c["data"]["attributes"]["ohlcv_list"]) for c in cs if c and c.get("data")]
     if not cs: raise RuntimeError("no OHLCV")
     vol, cl = C.Counter(), {}
@@ -168,7 +195,7 @@ def history(ch, d):
 
 def mind(ch, A, d):
     with cf.ThreadPoolExecutor(3) as ex: ll, tr, fr = ex.map(get, [f"https://api.llama.fi/overview/dexs/{ch.llama}?excludeTotalDataChartBreakdown=true",
-                                                                  f"https://api.geckoterminal.com/api/v2/networks/{ch.n}/trending_pools", "https://fomoradar.app/api/fresh" if ch.fomo else ""])
+                                                                  f"https://api.geckoterminal.com/api/v2/networks/{ch.gt}/trending_pools", "https://fomoradar.app/api/fresh" if ch.fomo else ""])
     L, cv, tv, td = [], {int(t // 86400): v for t, v in (ll or {}).get("totalDataChart") or []}, d.get("dvol") or {}, int(time.time() // 86400)
     if cv:
         sv = lambda k: tv.get(td - k, 0) / cv[td - k] * 100 if cv.get(td - k) else None
@@ -197,8 +224,8 @@ def security(ch, A, d):
     g = ((get(f"https://api.gopluslabs.io/api/v1/token_security/{ch.cid}?contract_addresses={A}") or {}).get("result") or {}).get(A.lower()) or {}
     k = ["is_honeypot", "cannot_sell_all", "buy_tax", "sell_tax", "is_mintable", "is_proxy", "hidden_owner", "can_take_back_ownership", "owner_change_balance", "transfer_pausable", "is_blacklisted", "slippage_modifiable", "is_open_source"]
     L.append("  GoPlus: " + (" ".join(f"{x}={g.get(x)}" for x in k if g.get(x) not in (None, "")) if g else "UNAVAILABLE"))
-    if ch.n == "base":
-        h = get(f"https://api.honeypot.is/v2/IsHoneypot?address={A}&chainID=8453") or {}
+    if ch.n in ("base", "ethereum"):
+        h = get(f"https://api.honeypot.is/v2/IsHoneypot?address={A}&chainID={ch.cid}") or {}
         L.append("  honeypot.is: " + (f"honeypot={h['honeypotResult'].get('isHoneypot')} buyTax={h['simulationResult'].get('buyTax')} sellTax={h['simulationResult'].get('sellTax')}" if h.get("simulationResult") else "UNAVAILABLE"))
     d.update(dec=dec, sup=sup or 1e9, gp=g)
     return L, {}
@@ -216,7 +243,7 @@ def launch(ch, A, d):
     cr = ch.call("eth_getTransactionByHash", [mint[0]["transactionHash"]])["from"].lower(); lg, a, w = [], mb, min(20000, ch.span)
     for _ in range(5):
         if a > ch.L or len(lg) >= 500: break
-        lg += ch.logs(A, a, min(a + w - 1, ch.L), [TR]); a += w
+        lg += ch.logs(A, a, min(a + w - 1, ch.L), [TR], cap_ok=True); a += w
     P = [(int(l["blockNumber"], 16), "0x" + l["topics"][1][-40:], "0x" + l["topics"][2][-40:], int(l["data"], 16) / 10 ** dec, l["transactionHash"]) for l in sorted([l for l in lg if len(l["topics"]) == 3], key=k)[:600]]
     ti, to = C.defaultdict(set), C.defaultdict(set)
     for b, f, t, v, h in P: ti[h].add(t); to[h].add(f)
@@ -227,7 +254,7 @@ def launch(ch, A, d):
         if t in fi and f in Sx: fi[t][1] += v
     fi = list(fi.items())[:20]; ws = [w for w, _ in fi] + [cr]; now = {w: (x or 0) / 10 ** dec for w, x in zip(ws, ch.bal(A, ws))}
     R = [dict(w=w, s=(b - mb) * ch.bt, l=v / sup * 100, n=now[w] / sup * 100) for w, (b, v) in fi]
-    dev = next((r for r in R if r["w"] == cr), None); fast = [r for r in R if r["s"] <= 3 and r["w"] != cr]
+    dev = next((r for r in R if r["w"] == cr), None); fast = [r for r in R if r["s"] <= 3 and r["w"] != cr]; d["cr"], d["clus"] = cr, set()
     L = [f"mint {ch.ago(mb):.1f}d ago (block {mb}) | deployer (tx.from) {cr}",
          f"  dev buy {dev['l']:.2f}% -> now {dev['n']:.2f}%" if dev else f"  no dev buy among first buyers; deployer holds {now[cr]/sup*100:.2f}%",
          f"  first {len(R)} buyers: launch {sum(r['l'] for r in R):.1f}% -> now {sum(r['n'] for r in R):.1f}% | fully out {sum(r['n'] < 0.05 * r['l'] for r in R)}/{len(R)} | within 3s of mint: {len(fast)} ({sum(r['l'] for r in fast):.1f}%)",
@@ -237,15 +264,17 @@ def launch(ch, A, d):
         if f in Sx and t not in Sx and t != cr: bg[b].append((t, v))
     for b, lst in sorted(bg.items(), key=lambda x: -sum(v for _, v in x[1]))[:6]:
         m = S.median(v for _, v in lst); sim = {t for t, v in lst if 0.75 * m <= v <= 1.25 * m}
+        if len(sim) >= 3: d["clus"] |= sim
         if len(sim) >= 3: L.append(f"  SAME-BLOCK SIMILAR-SIZE GROUP +{(b-mb)*ch.bt:.1f}s: {len(sim)} wallets ~{m/sup*100:.2f}% each -> {sum(v for t, v in lst if t in sim)/sup*100:.1f}% at launch, {sum(x or 0 for x in ch.bal(A, list(sim)))/10**dec/sup*100:.1f}% now (LIKELY COORDINATED)")
     i, o, ok = xfer(ch, A, cr, mb); lab = {DEAD: "BURN", Z: "BURN", **ch.infra}; ct = C.Counter()
     for _, x, v in o: ct[lab.get(x, sh(x))] += v / 10 ** dec
     L.append(f"CREATOR {sh(cr)}: {'contract' if ch.codes([cr])[0] > 23 else 'wallet'} | ETH {ch.eth([cr])[0]:.2f} | holds {now[cr]/sup*100:.2f}% | in {len(i)} / out {len(o)} txs{'' if ok else ' (latest 200 only)'} | outflows: " + ("; ".join(f"{a} {v/sup*100:.2f}%" for a, v in ct.most_common(3)) or "none"))
     bu = []
+    bf = 0
     for t in (DEAD, Z):
         try: bu += xfer(ch, A, t, mb)[0]
-        except Exception: pass
-    if not bu: L.append("BURNS: none found"); return L, {}
+        except Exception: bf += 1
+    if not bu: L.append("BURNS: UNAVAILABLE (burn-address history fetch failed)" if bf == 2 else "BURNS: none found" + (" (one of two burn addresses UNAVAILABLE)" if bf else "")); return L, {}
     dd, src = C.Counter(), C.Counter()
     for b, f, v in bu: v /= 10 ** dec; dd[int(ch.ago(b))] += v; src[f] += v
     l3, p4 = sum(dd[j] for j in range(3)) / 3, sum(dd[j] for j in range(3, 7)) / 4; tp = [x for x in src.most_common(3) if x[1] / sup >= 1e-4]; ee = ch.eth([w for w, _ in tp])
@@ -255,7 +284,20 @@ def launch(ch, A, d):
     return L, {}
 
 
-def cands(ch, A, d, fomo):
+def lbparse(j):
+    """FOMO leaderboard -> {address: (handle, score)}; tolerant of the JSON layout (any object with a 0x address plus handle or score)."""
+    out = {}
+    def walk(x):
+        if isinstance(x, dict):
+            a = next((x[k] for k in ("address", "wallet", "wallet_address", "addr") if isinstance(x.get(k), str) and re.fullmatch(r"0x[0-9a-fA-F]{40}", x[k])), None)
+            if a and (x.get("handle") or x.get("score") is not None): out[a.lower()] = (x.get("handle") or x.get("username") or sh(a), x.get("score"))
+            for v in x.values(): walk(v)
+        elif isinstance(x, list):
+            for v in x: walk(v)
+    walk(j); return out
+
+
+def cands(ch, A, d, fomo, lb=None):
     ex = set(ch.infra) | {Z, DEAD} | {p["id"].lower() for p in d["pools"]}
     tag = {h["address"].lower(): (h.get("tag") or "") + (" locked" if h.get("is_locked") else "") for h in d["gp"].get("holders") or []}
     if ch.bs:
@@ -270,16 +312,25 @@ def cands(ch, A, d, fomo):
     gx = sorted((r["p"] for r in R if r["w"] in tag), reverse=True)[:10]  # GoPlus lists only the top 10 incl. infra: fill missing ranks with its smallest external (upper bound)
     adj = sum(gx) + (10 - len(gx)) * gx[-1] if gx and not ch.bs and len(gx) < 10 else sum(r["p"] for r in R[:10]) if tag else gest
     d.update(R=R, exited=[f"{h['handle']} ({h['score']})" for w, h in fh.items() if not any(r["w"] == w and r["p"] > 0.05 for r in R)], adj=adj)
-    return ["INFRA: " + " | ".join(f"{ch.infra.get(w, 'burn')} {v:.2f}%" for w, v in inf.items()),
+    xm = []
+    if ch.n in ("base", "ethereum") and lb is not False:  # lb: dict = parsed leaderboard, None = fetch failed, False = not requested (quick)
+        m = lbparse(lb) if lb else {}
+        for r in R:
+            if r["w"] in m and r["p"] > 0: r["h"], r["sc"] = str(m[r["w"]][0]), f"RHC{m[r['w']][1]}"
+        hit = [r for r in R if r["w"] in m and r["p"] > 0]
+        xm = ["FOMO CROSS-MATCH (lead only; Robinhood Chain score, same address): " + (", ".join(f"{r['h'][:16]} (RHC score {m[r['w']][1]}) holds {r['p']:.2f}%" for r in hit[:6]) if hit
+              else f"none of {len(m)} leaderboard wallets among the top {len(R)} holders" if m else "UNAVAILABLE (leaderboard fetch or format)")]
+    iv = inf.items() if len(ch.infra) <= 3 else [(w, v) for w, v in inf.items() if v >= 0.01 or w == DEAD]
+    return ["INFRA: " + " | ".join(f"{ch.infra.get(w, 'burn')} {v:.2f}%" for w, v in iv),
             f"ADJ TOP-10 {d['adj'] or 0:.1f}% -> {band('adj_top10', d['adj'])} ({'live balances' + (', ranks beyond the GoPlus top-10 filled as upper bound' if not ch.bs and len(gx) < 10 else '') if tag else 'GeckoTerminal distribution estimate'}; ESTIMATED) | largest: "
-            + ", ".join(f"{r['h'][:16]} {r['p']:.1f}%" for r in R[:5])], {}
+            + ", ".join(f"{r['h'][:16]} {r['p']:.1f}%" for r in R[:5])] + xm, {}
 
 
 def holders(ch, A, d, fomo):
     R, sup, dec, w7 = [r for r in d.get("R", []) if r["p"] > 0.05][:8], d["sup"], d["dec"], ch.back(7)
     def one(r):
         i, o, ok = xfer(ch, A, r["w"]); v = lambda x: x[2] / 10 ** dec
-        r.update(rec=sum(map(v, i)), sent=sum(map(v, o)), f=min((x[0] for x in i), default=None), ls=max((x[0] for x in o), default=None), ok=ok,
+        r.update(ins=i, outs=o, rec=sum(map(v, i)), sent=sum(map(v, o)), f=min((x[0] for x in i), default=None), ls=max((x[0] for x in o), default=None), ok=ok,
                  i7=sum(v(x) for x in i if x[0] >= w7) / sup * 100, o7=sum(v(x) for x in o if x[0] >= w7) / sup * 100)
         r["prof"] = get(f"https://fomoradar.app/api/trader/{r['w']}", 25) if ch.fomo else None; return r
     with cf.ThreadPoolExecutor(3) as ex: R = list(ex.map(one, R))
@@ -290,7 +341,7 @@ def holders(ch, A, d, fomo):
         tg = " ADDING" if r["i7"] >= 0.02 and r["i7"] > 2 * r["o7"] else " TRIMMING" if r["o7"] >= 0.02 and r["o7"] > 2 * r["i7"] else ""
         if h is not None: mix[next(b for b, x in (("<3d", 3), ("3-7d", 7), ("7-14d", 14), ("14-21d", 21), (">21d", 1e9)) if h < x)] += r["p"]
         ent = d.get("close", {}).get(int(ch.ts(r["f"]) // 86400)) if r["f"] else None
-        if ent: m = d["price"] / ent; mult.append(m); prof += r["p"] if m > 1 else 0
+        if ent: m = d["price"] / ent; mult.append(m); prof += r["p"] if m > 1 else 0; r["m"] = m
         p, st = (r["prof"] if isinstance(r["prof"], dict) and r["prof"].get("handle") else None), "profile n/a"
         if p:
             pos = p.get("positions") or []; wn = sorted([x for x in pos if (x.get("pnl") or 0) > 0], key=lambda x: -x["pnl"])[:2]; wr = (p.get("stats") or {}).get("win_rate")
@@ -308,13 +359,108 @@ def holders(ch, A, d, fomo):
         L.append(f"  scored cohort: {fomo.get('trusted_holders')} holders, avg score {fomo.get('avg_score') or 0:.0f}, value {usd(fomo.get('cohort_value'))} | flow last {fomo.get('hours')}h: buys {fs('buy')} vs sells {fs('sell')} | seeded {(fomo.get('seeded') or {}).get('wallets')}")
         if th.get("text"): L.append(f"  holder thesis (HOLDER-REPORTED, {th.get('handle')}): \"{th['text'][:100]}\"")
     d["prof"] = R
+    try: L.append(dds(ch, d, R))
+    except Exception as e: L.append(f"  DRAWDOWNS SURVIVED (DDS): UNAVAILABLE ({str(e)[:60]}) | healthy >=50% | no credit")
     return L, {}
 
 
+def zigzag(cl, th=0.30):
+    """Daily closes [(day, px)] -> drawdown episodes [((peak_day, peak_px), (low_day, low_px))]: >=th fall from a local high; a new high needs a >=th rebound."""
+    eps, pk, tr = [], cl[0], None
+    for day, px in cl[1:]:
+        if tr is None:
+            if px > pk[1]: pk = (day, px)
+            elif px <= pk[1] * (1 - th): tr = (day, px)
+        elif px < tr[1]: tr = (day, px)
+        elif px >= tr[1] * (1 + th): eps.append((pk, tr)); pk, tr = (day, px), None
+    return eps + ([(pk, tr)] if tr else [])
+
+
+def dds(ch, d, R):
+    H = "  DRAWDOWNS SURVIVED (DDS): "
+    cl = sorted((k, v) for k, v in (d.get("close") or {}).items() if v)
+    if len(cl) < 3: return H + "UNAVAILABLE (no daily price history) | healthy >=50% | no credit"
+    eps = zigzag(cl)
+    if not eps: return H + f"NOT YET OBSERVABLE (no >=30% drawdown in {len(cl)} daily closes) | healthy >=50% | NOT YET OBSERVABLE (no credit)"
+    sup, dec = d["sup"], d["dec"]; ex = ({d["cr"]} if d.get("cr") else set()) | d.get("clus", set()) | {d["A"]}
+    def surv(r):  # returns (credited % of supply, history_ok)
+        now, best, known = r["p"] / 100 * sup, 0.0, False
+        tsl = lambda lst: [(ch.ts(b), v / 10 ** dec) for b, _, v in lst]
+        ins, outs = tsl(r.get("ins", [])), tsl(r.get("outs", []))
+        first = min([t for t, _ in ins + outs], default=None)
+        for (pd, _), (ld, _) in eps:
+            t0, t1 = pd * 86400, (ld + 1) * 86400
+            if not r.get("ok", True) and (first is None or first > t0): continue  # truncated history does not reach the high: unknown
+            known = True
+            bag = now - sum(v for t, v in ins if t >= t0) + sum(v for t, v in outs if t >= t0)  # balance at the high, rebuilt backwards from today
+            if bag <= now * 1e-3: continue
+            sold = sum(v for t, v in outs if t0 <= t < t1) / bag
+            if sold < 0.25: best = max(best, min(bag * (1 - sold), now) / sup * 100)
+        return best, known
+    rows = [(r, *surv(r)) for r in R]
+    inc = [x for x in rows if x[0]["w"] not in ex]; tot = sum(x[0]["p"] for x in inc) or 1
+    sv = sum(s for _, s, _ in inc); pr = sum(s for r, s, _ in inc if r.get("m", 0) > 1); uw = sum(s for r, s, _ in inc if r.get("m") and r["m"] <= 1)
+    unk = sum(r["p"] for r, _, k in inc if not k); share = sv / tot * 100; deep = min(eps, key=lambda e: e[1][1] / e[0][1])
+    cs = sum(s for (r, s, _), c in zip(inc, ch.codes([r["w"] for r, _, _ in inc])) if c > 23 and s)  # >23 B = real contract (vault, Safe), not a 7702-delegated wallet
+    exc = [x for x in rows if x[0]["w"] in ex]
+    lab = lambda w: "token contract" if w == d["A"] else "creator" if w == d.get("cr") else "cluster"
+    xs = ("; excluded: " + ", ".join(f"{lab(r['w'])} {sh(r['w'])} {r['p']:.2f}% ({'survived' if s else 'did not' if k else 'unknown'})" for r, s, k in exc)) if exc \
+        else ("; creator/cluster not among profiled holders" if d.get("cr") else "; creator/cluster UNKNOWN (launch block UNAVAILABLE)")
+    return (H + f"{share:.0f}% of profiled top-holder supply ({tot:.1f}% of supply) held through >=1 drawdown >=30% | in profit {pr/tot*100:.0f}% / underwater {uw/tot*100:.0f}% / entry n/a {max(0, sv-pr-uw)/tot*100:.0f}%"
+            + (f" | in contracts (vault/Safe) {cs/tot*100:.0f}%" if cs else "")
+            + f" | {len(eps)} drawdown(s), deepest {(deep[1][1]/deep[0][1]-1)*100:.0f}% ({datetime.fromtimestamp(deep[0][0]*86400, timezone.utc):%m-%d} -> {datetime.fromtimestamp(deep[1][0]*86400, timezone.utc):%m-%d})"
+            + (f" | history short of the high for {unk/tot*100:.0f}% (no credit)" if unk else "") + xs + f" | healthy >=50% | {band('dds', share)}")
+
+
+def gtget(u):  # GeckoTerminal with a short back-off on its free-tier rate limit
+    for k in range(3):
+        r = get(u)
+        if isinstance(r, dict) and r.get("data") is not None: return r
+        time.sleep(2 * (k + 1))
+    return None
+
+
+def absorb(ch, d):
+    H, p = "  DIP ABSORPTION (ABS, hourly 7d, largest pool, price proxy ESTIMATED): ", max(d["pools"], key=lambda p: p["liq"])
+    u = f"https://api.geckoterminal.com/api/v2/networks/{ch.gt}/pools/{p['id']}"
+    o = gtget(u + "/ohlcv/hour?aggregate=1&limit=168")
+    if not o: return [H + "UNAVAILABLE (GeckoTerminal hourly candles) | healthy >=1.0 or >=50% retraced | no credit"], {}
+    k = sorted(o["data"]["attributes"]["ohlcv_list"]); n = len(k)  # [ts, o, h, l, c, v]
+    hit = [i for i in range(n) if k[i][3] <= 0.85 * max(x[2] for x in k[max(0, i - 24):i + 1])]
+    grp = []
+    for i in hit:
+        if grp and i - grp[-1][-1] <= 1: grp[-1].append(i)
+        else: grp.append([i])
+    if not grp: return [H + f"NOT YET OBSERVABLE (no -15% dip within 24h in {n}h) | healthy >=1.0 or >=50% retraced | NOT YET OBSERVABLE (no credit)"], {}
+    D = []
+    for g in grp:
+        lo = min(g, key=lambda i: k[i][3]); pk = max(range(max(0, lo - 24), lo + 1), key=lambda i: k[i][2]); aft = k[lo + 1:lo + 25]
+        hi, lw = k[pk][2], k[lo][3]; ref = aft[-1][4] if aft else k[lo][4]
+        D.append(dict(t=k[lo][0], drop=(lw / hi - 1) * 100, ret=max(0.0, (ref - lw) / (hi - lw)) if hi > lw else 0, held=all(x[3] >= lw for x in aft) if aft else None, h=len(aft), bs=None, b=0, s=0))
+    last = D[-1]
+    if time.time() - last["t"] < 24 * 3600:
+        tr = gtget(u + "/trades")
+        if tr:
+            for x in tr["data"]:
+                a = x["attributes"]; t = datetime.fromisoformat(a["block_timestamp"].replace("Z", "+00:00")).timestamp()
+                if t >= last["t"]: last["b" if a.get("kind") == "buy" else "s"] += float(a.get("volume_in_usd") or 0)
+            old = min(datetime.fromisoformat(x["attributes"]["block_timestamp"].replace("Z", "+00:00")).timestamp() for x in tr["data"]) if tr["data"] else time.time()
+            if old <= last["t"] and last["s"]: last["bs"] = last["b"] / last["s"]
+    for x in D: x["sc"] = max(x["bs"] or 0, 2 * x["ret"])
+    med = S.median(x["sc"] for x in D)
+    return [H + f"{len(D)} dip(s); latest {datetime.fromtimestamp(last['t'], timezone.utc):%m-%d %H}h {last['drop']:.0f}%: retraced {last['ret']*100:.0f}% "
+            + ("in 24h" if last["h"] >= 24 else f"so far ({last['h']}h)") + f", low {'held' if last['held'] else 'broken' if last['held'] is False else 'n/a (just now)'}"
+            + (f", buy/sell after low {last['bs']:.2f} ({usd(last['b'])}/{usd(last['s'])})" if last["bs"] is not None else ", buy/sell n/a (trades do not reach the low)")
+            + f" | median score {med:.2f} | healthy >=1.0 or >=50% retraced | {band('abs', med)}"], {}
+
+
 def exitq(ch, A, d):
-    w = d["R"][0]["p"] / 100 * d["sup"] * d["price"] if d.get("R") else None
+    w = d["R"][0]["p"] / 100 * d["sup"] * d["price"] if d.get("R") else None; G = {}
     def q(u):
-        try: r = get(f"https://aggregator-api.kyberswap.com/{ch.n}/api/v1/routes?tokenIn={A}&tokenOut={ch.stable}&amountIn={int(u/d['price']*10**d['dec'])}", h={"x-client-id": "scan"})["data"]["routeSummary"]; return u, (1 - float(r["amountOutUsd"]) / float(r["amountInUsd"])) * 100
+        try:
+            r = get(f"https://aggregator-api.kyberswap.com/{ch.n}/api/v1/routes?tokenIn={A}&tokenOut={ch.stable}&amountIn={int(u/d['price']*10**d['dec'])}", h={"x-client-id": "scan"})["data"]["routeSummary"]
+            g = float(r.get("gasUsd") or 0) if ch.gas else 0; G[u] = g
+            return u, (1 - (float(r["amountOutUsd"]) - g) / float(r["amountInUsd"])) * 100
         except Exception: return u, None
     with cf.ThreadPoolExecutor(3) as ex: R = sorted(ex.map(q, sorted({1000, 2500, 5000, 10000, 15000, 25000, 50000} | ({round(w)} if w else set()))))
     ok = [(u, i) for u, i in R if i is not None]
@@ -328,7 +474,7 @@ def exitq(ch, A, d):
             if u2 and i2 > lim: break
         return best
     wi = next((i for u, i in R if w and u == round(w)), None); d["cap"] = cap(5)
-    return ["ladder (sell to stable, incl. fees): " + " | ".join(f"{usd(u)} {'n/a' if i is None else f'{i:.1f}%'}" for u, i in R),
+    return [f"ladder (sell to stable, incl. fees{f' + gas ~{usd(S.median(G.values()))}/tx' if ch.gas and G else ''}): " + " | ".join(f"{usd(u)} {'n/a' if i is None else f'{i:.1f}%'}" for u, i in R),
             f"  EXIT CAP <=5%: {usd(d['cap'])} ({d['cap']/d['mc']*100 if d.get('mc') else 0:.2f}% of MC) | stressed (-50% liq): {usd(cap((5 + b0) / 2))}"
             + (f" | largest holder bag {usd(w)}: {wi:.1f}% -> {band('whale_exit', wi)}" if wi is not None else "")], {}
 
@@ -336,7 +482,8 @@ def exitq(ch, A, d):
 def lp(ch, d):
     pm, tot = next((k for k, v in ch.infra.items() if "PoolManager" in v), None), d["liq"] or 1
     L = ["LP per pool >10% of liquidity (V4 churn 7d = managed/removable, not a lock proof; ESTIMATED):"]
-    L += [f"  GoPlus LP holder {sh(h.get('address', ''))} {float(h.get('percent') or 0)*100:.0f}% tag={h.get('tag')} locked={h.get('is_locked')}" for h in (d["gp"].get("lp_holders") or [])[:3]]
+    L += [f"  GoPlus LP holder {sh(h.get('address', ''))} {float(h.get('percent') or 0)*100:.0f}% tag={h.get('tag')} locked={h.get('is_locked')}"
+          + (f" [{ch.infra[h.get('address', '').lower()]}]" if ch.n == "ethereum" and h.get("address", "").lower() in ch.infra else "") for h in (d["gp"].get("lp_holders") or [])[:3]]
     for p in [p for p in sorted(d["pools"], key=lambda p: -p["liq"]) if p["liq"] >= 0.1 * tot][:4]:
         t = f"  {p['q']} {sh(p['id'])} {usd(p['liq'])} ({p['liq']/tot*100:.0f}%)"
         if "pons" in str(p["dex"]): L.append(t + ": Pons pool, LP in Pons locker by template"); continue
@@ -389,31 +536,50 @@ def kpis(d):
 def main():
     a = sys.argv[1:]
     if "--bands" in a: [print(f"{k}: cuts {c} -> {l}") for k, (c, l) in BANDS.items()]; [print(x) for x in RULES]; return
-    if not a or not a[0].startswith("0x"): print("Not an EVM address (Solana: manual)."); return
+    if not a: print(__doc__); return
     A = a[0]; mode = next((x for x in a[1:] if x in ("quick", "standard", "recheck", "activity")), "standard")
     o = lambda k: next((a[i + 1] for i, x in enumerate(a) if x == k and i + 1 < len(a)), None); lst = lambda k: [x for x in (o(k) or "").split(",") if x]
-    chain = o("--chain") or next((c for c in CH if get(f"https://api.dexscreener.com/tokens/v1/{c}/{A}")), None)
-    if chain not in CH: print("Not found on Robinhood Chain/Base via DexScreener; pass --chain or scan manually."); return
+    if not A.startswith("0x"):
+        print("Solana address (format): not in scan.py coverage yet; scan manually (prompt §5)." if re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", A) else "Not an EVM or Solana address."); return
+    chain, note = o("--chain"), None
+    if not chain:  # one DexScreener call: every chain with a pool for this address, by liquidity
+        j = get(f"https://api.dexscreener.com/latest/dex/tokens/{A}")
+        if j is None: print("UNAVAILABLE chain detection (DexScreener); pass --chain robinhood|base|ethereum"); return
+        lq = C.Counter()
+        for p in j.get("pairs") or []:
+            if A.lower() in (p["baseToken"]["address"].lower(), p["quoteToken"]["address"].lower()): lq[p["chainId"]] += (p.get("liquidity") or {}).get("usd") or 0
+        if not lq: print("Not found on DexScreener (too new?); pass --chain robinhood|base|ethereum or scan manually."); return
+        chain = max(lq, key=lq.get)
+        if len(lq) > 1: note = "MULTI-CHAIN: same address has pools on " + ", ".join(f"{c} {usd(v)}" for c, v in lq.most_common()) + f" -> scanning {chain} (highest liquidity); other chain: --chain"
+        if chain not in CH: print(f"Found on {chain}: not in scan.py coverage (robinhood/base/ethereum); scan manually (prompt §5)." + (f"\n{note}" if note else "")); return
+    if chain not in CH: print(f"--chain {chain} not supported (robinhood/base/ethereum)."); return
     ch, out = Ch(chain), lambda h, L: (print(f"== {h} =="), [print(x) for x in L])
     if mode == "activity": ch.setup(); out("CORE ACTIVITY", safe("activity", platform, ch, lst("--platform"), {})[0]); return
     with cf.ThreadPoolExecutor(3) as ex:
         ft, fs = ex.submit(safe, "tape", tape, ch, A), ex.submit(ch.setup)
         ff = ex.submit(get, f"https://fomoradar.app/api/token/{A}", 25) if ch.fomo and mode != "recheck" else None
+        fl = ex.submit(get, LB_URL, 25) if chain in ("base", "ethereum") and mode == "standard" else None
         tl, d = ft.result()
         try: fs.result()
         except Exception as e: print("UNAVAILABLE rpc:", e); return
-    print(f"SCAN {mode.upper()} | {A} | {chain} | tier A"); out("TAPE", tl)
+    print(f"SCAN {mode.upper()} | {A} | {chain} | tier A"); note and print(note); out("TAPE", tl)
     if not d: return
-    ch.b0 = max(ch.L - int((time.time() - d["created"] + 86400) / ch.bt), 0)
+    ch.b0 = max(ch.L - int((time.time() - d["created"] + 86400) / ch.bt), 0); d["A"] = A.lower()
     out("CONTRACT", safe("contract", security, ch, A, d)[0])
     if "dec" not in d: d.update(dec=18, sup=(d["mc"] or 1e9 * d["price"]) / d["price"], gp={})
     if mode == "recheck": out("RECHECK", safe("recheck", recheck, ch, A, d, [w.lower() for w in lst("--wallets")], float(o("--liq-floor") or 0))[0]); print(f"[{time.time()-T0:.0f}s, {N[0]} requests]"); return
     fomo = ff.result() if ff else None; fomo = fomo if isinstance(fomo, dict) and fomo.get("holders") is not None else None
-    with cf.ThreadPoolExecutor(4) as ex: res = [f.result()[0] for f in [ex.submit(safe, "history", history, ch, d), ex.submit(safe, "holders", cands, ch, A, d, fomo), ex.submit(safe, "lp", lp, ch, d), ex.submit(safe, "launch", launch, ch, A, d)]]
-    jobs = [("EXIT", exitq, (ch, A, d))] + ([("MINDSHARE", mind, (ch, A, d)), ("WHO HOLDS IT", holders, (ch, A, d, fomo))] if mode == "standard" else []) + ([("CORE ACTIVITY", platform, (ch, lst("--platform"), d))] if lst("--platform") else [])
-    with cf.ThreadPoolExecutor(4) as ex: R2 = [(h, ex.submit(safe, h.lower(), f, *x)) for h, f, x in jobs]
+    lb = fl.result() if fl else False
+    with cf.ThreadPoolExecutor(4) as ex: res = [f.result()[0] for f in [ex.submit(safe, "history", history, ch, d), ex.submit(safe, "holders", cands, ch, A, d, fomo, lb), ex.submit(safe, "lp", lp, ch, d), ex.submit(safe, "launch", launch, ch, A, d)]]
+    jobs = [("EXIT", exitq, (ch, A, d))] + ([("MINDSHARE", mind, (ch, A, d)), ("WHO HOLDS IT", holders, (ch, A, d, fomo)), ("ABS", absorb, (ch, d))] if mode == "standard" else []) + ([("CORE ACTIVITY", platform, (ch, lst("--platform"), d))] if lst("--platform") else [])
+    with cf.ThreadPoolExecutor(5) as ex: R2 = [(h, ex.submit(safe, h.lower(), f, *x)) for h, f, x in jobs]
     for h, x in zip(("PRICE HISTORY", "OWNERSHIP", "LP", "LAUNCH / CREATOR / BURNS"), res): out(h, x)
-    for h, f in R2: out(h, f.result()[0])
+    R2 = {h: f.result()[0] for h, f in R2}
+    if "WHO HOLDS IT" in R2:  # the two holder-strength lines (DDS, ABS) close the WHO HOLDS IT block
+        w = R2["WHO HOLDS IT"]
+        if not any("DRAWDOWNS SURVIVED" in x for x in w): w.append("  DRAWDOWNS SURVIVED (DDS): UNAVAILABLE (holder history) | healthy >=50% | no credit")
+        w.append(R2.pop("ABS")[0].replace("UNAVAILABLE abs:", "  DIP ABSORPTION (ABS): UNAVAILABLE"))
+    for h, x in R2.items(): out(h, x)
     out("KPIS (bands: scan.py --bands)", kpis(d)); print(f"[{time.time()-T0:.0f}s, {N[0]} requests; Solana, funding/cluster tracing and web claims stay manual]")
 
 
